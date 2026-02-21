@@ -1,0 +1,857 @@
+---
+title: "Assignment 2 - kNN for Regression and Classification"
+subtitle: "MBAN 5560 - Due February 22, 2026 (Sunday) 11:59pm"
+author: "Mina Tavakkoli Jouybari"
+date: "today"
+format: 
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+**LLM Disclosure:** Claude (Anthropic) was used to assist with some code structure,and answer framing in this assignment.
+
+In this assignment, you will apply k-Nearest Neighbors (kNN) to two real-world prediction tasks. Each section is self-contained: you will preprocess the data, tune the hyperparameter k using bootstrap validation, evaluate your model on a held-out test set, and interpret your results.
+
+**Important Notes:**
+
+- You can team up with **two classmates** for this assignment (maximum 3 students per team). Submit one assignment per team.
+- Use R and Quarto for your analysis. Submit the rendered HTML file along with the QMD source file.
+- Make sure your code runs without errors and produces the expected outputs.
+- **DO NOT use `train()` for hyperparameter tuning** — implement your own grid search with bootstrap validation.
+- Provide interpretations and explanations for your results, not just code outputs.
+- Using LLM assistance is allowed, but you must disclose which tool you used and how it helped.
+
+> ⚠️ **Runtime Note:** The nested tuning loops in Sections 1.2 and 2.2 can take **10–15 minutes** to complete depending on your computer. We recommend rendering this document overnight or while you take a break. The `cache=TRUE` option in the code chunks means subsequent renders will be fast — only the first run is slow.
+
+**Datasets (included in the Assignment folder):**
+
+- [Ames Housing Dataset](https://www.kaggle.com/datasets/prevek18/ames-housing-dataset?resource=download) — `AmesHousing.csv`
+- [Telco Customer Churn](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) — `WA_Fn-UseC_-Telco-Customer-Churn.csv`
+
+```{r setup}
+library(tidyverse)
+library(caret)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# Section 1: Predicting House Sale Prices — kNN Regression (50 points) {#sec-regression}
+
+**Objective:** Your goal is to predict the **sale price** (`SalePrice`) of houses in Ames, Iowa using kNN regression.
+
+## 1.1 Data Preprocessing (10 points)
+
+Load the Ames Housing dataset and prepare it for kNN regression.
+
+The Ames dataset contains 82 variables. Because kNN is a distance-based algorithm, it does not perform well with a large number of features (curse of dimensionality). For this assignment, **use only the following variables:**
+
+| Variable | Description |
+|---|---|
+| `SalePrice` | Sale price in dollars (**target**) |
+| `Gr.Liv.Area` | Above grade living area (sq ft) |
+| `Total.Bsmt.SF` | Total basement area (sq ft) |
+| `Garage.Area` | Size of garage (sq ft) |
+| `Year.Built` | Original construction date |
+| `Overall.Qual` | Overall material and finish quality (1–10) |
+| `Overall.Cond` | Overall condition rating (1–10) |
+
+**Your tasks:**
+
+1. Load the data and subset to the variables listed above
+2. Handle any missing values (e.g., median imputation for numeric columns)
+3. **Standardize all numeric predictors** (not the target `SalePrice`) using `preProcess()` from `caret` or `scale()`
+
+```{r preprocess-ames}
+# YOUR CODE HERE
+# 1. Load the data
+ames <- read.csv("AmesHousing.csv")
+
+# 2. Subset to the specified variables
+ames <- ames %>%
+  select(SalePrice, Gr.Liv.Area, Total.Bsmt.SF, Garage.Area, 
+         Year.Built, Overall.Qual, Overall.Cond)
+
+# 3. Handle missing values (median imputation on predictors only)
+predictors <- c("Gr.Liv.Area", "Total.Bsmt.SF", "Garage.Area", 
+                "Year.Built", "Overall.Qual", "Overall.Cond")
+
+ames <- ames %>%
+  mutate(across(all_of(predictors), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# 4. Standardize numeric predictors (NOT SalePrice)
+pre_proc <- preProcess(ames[, predictors], method = c("center", "scale"))
+ames[, predictors] <- predict(pre_proc, ames[, predictors])
+
+# Sanity check
+dim(ames)
+sum(is.na(ames))
+summary(ames$SalePrice)
+
+```
+
+#### **Question 1 (5 points):** How many observations are in the dataset? Provide a brief summary of the target variable `SalePrice` (range, mean, distribution shape).
+
+**Your Answer:**
+There are 2,930 observations in the dataset.
+The sale prices range from $12,789 to $755,000.
+The mean price is $180,796, and the median is $160,000.
+
+Because the mean is higher than the median and the maximum is much larger than the third quartile, the distribution is right-skewed. This means there are some high-priced houses pulling the average upward.
+
+#### **Question 2 (5 points):** Why is standardization necessary before applying kNN? What would happen if you did not standardize?
+
+**Your Answer:**
+Standardization is necessary for kNN because it is a distance-based algorithm.
+If variables are measured on different scales (for example, square footage in the thousands versus quality ratings from 1–10), the larger-scale variables will dominate the distance calculation.
+Without standardization, the model would give too much weight to variables like living area and almost ignore smaller-scale variables like overall quality. This would lead to biased and unreliable neighbor selection.
+
+---
+
+## 1.2 kNN Regression: Tuning and Evaluation (30 points)
+
+In this section, tuning and evaluation happen together in **each** iteration. For every train-test split, you find the optimal *k* on that split's training set, then evaluate with that *k* on that split's test set. This ensures the reported performance honestly reflects the full process.
+
+**Requirements:**
+
+- Use `knnreg()` from the `caret` package (**not** `train()`)
+- Run **20 iterations** (each with a different random train-test split)
+- Within each iteration, perform a grid search over *k* (from 1 to 30) using bootstrap validation on the training set (e.g., 20 bootstrap samples per *k*)
+- Use the optimal *k* from that iteration to predict on that iteration's test set
+
+**Loop structure:**
+
+```
+for i in 1:20:
+    split data into train (80%) and test (20%)
+
+    for each k in grid:
+        for j in 1:20:
+            bootstrap sample from train → boot_train
+            OOB observations → boot_val
+            fit knnreg on boot_train, predict on boot_val
+            compute RMSPE
+        mean RMSPE for this k (across 20 bootstraps)
+
+    optimal_k[i] ← k with lowest mean RMSPE for this split
+    fit knnreg with optimal_k[i] on train, predict on test
+    test_RMSPE[i] ← RMSPE on test set
+
+Report: distribution of optimal_k values and distribution of test_RMSPE values
+        (mean and SD)
+```
+
+```{r knn-regression-tuning, cache=TRUE}
+# YOUR CODE HERE
+
+set.seed(123)
+
+k_grid <- 1:30
+n_iter <- 20
+n_boot <- 20
+
+optimal_k  <- numeric(n_iter)
+test_RMSPE <- numeric(n_iter)
+last_mean_rmspe <- numeric(length(k_grid))
+
+# Save one representative split for Q5
+rep_actual <- NULL
+rep_preds  <- NULL
+
+# 1. Run 20 iterations, each with a fresh 80/20 split
+for (i in 1:n_iter) {
+  
+  train_idx <- sample(1:nrow(ames), size = 0.8 * nrow(ames))
+  train <- ames[train_idx, ]
+  test  <- ames[-train_idx, ]
+  
+  mean_rmspe <- numeric(length(k_grid))
+  
+  # 2. Within each iteration: grid search with bootstrap on training set → find optimal k
+  for (ki in seq_along(k_grid)) {
+    k <- k_grid[ki]
+    boot_rmspe <- rep(NA, n_boot)
+    
+    for (j in 1:n_boot) {
+      boot_idx   <- sample(1:nrow(train), size = nrow(train), replace = TRUE)
+      boot_train <- train[boot_idx, ]
+      boot_val   <- train[-unique(boot_idx), ]
+      
+      if (nrow(boot_val) == 0) next
+      
+      model <- knnreg(SalePrice ~ ., data = boot_train, k = k)
+      preds <- predict(model, boot_val)
+      boot_rmspe[j] <- sqrt(mean(((preds - boot_val$SalePrice) / boot_val$SalePrice)^2))
+    }
+    
+    mean_rmspe[ki] <- mean(boot_rmspe, na.rm = TRUE)
+  }
+  
+  # 3. Evaluate with that optimal k on that iteration's test set
+  optimal_k[i] <- k_grid[which.min(replace(mean_rmspe, is.na(mean_rmspe), Inf))]
+  
+  if (i == n_iter) last_mean_rmspe <- mean_rmspe
+  
+  final_model <- knnreg(SalePrice ~ ., data = train, k = optimal_k[i])
+  test_preds  <- predict(final_model, test)
+  
+  # 4. Store optimal_k and test_RMSPE for each iteration
+  test_RMSPE[i] <- sqrt(mean(((test_preds - test$SalePrice) / test$SalePrice)^2))
+  
+  # Save last iteration as representative split for Q5
+  if (i == n_iter) {
+    rep_actual <- test$SalePrice
+    rep_preds  <- test_preds
+  }
+}
+
+# 5. Report mean RMSPE and SD
+cat("Optimal k distribution:\n"); print(table(optimal_k))
+cat("\nMean test RMSPE:", round(mean(test_RMSPE), 4))
+cat("\nSD test RMSPE:  ", round(sd(test_RMSPE), 4))
+
+# Q3: Mean RMSPE vs k
+plot(k_grid, last_mean_rmspe, type = "b",
+     xlab = "k",
+     ylab = "Mean RMSPE",
+     main = "Mean RMSPE vs k (Last Iteration)")
+
+# Q4: Histogram of test RMSPE
+hist(test_RMSPE,
+     main = "Distribution of Test RMSPE (20 Splits)",
+     xlab = "Test RMSPE",
+     col = "lightblue",
+     border = "white")
+
+# Q5: Scatter plot of Actual vs Predicted (representative split)
+plot(rep_actual, rep_preds,
+     xlab = "Actual Sale Price",
+     ylab = "Predicted Sale Price",
+     main = "Actual vs Predicted Sale Price (Representative Split)",
+     col  = "steelblue",
+     pch  = 16)
+abline(0, 1, col = "red", lwd = 2)  # perfect prediction line
+```
+
+#### **Question 3 (5 points):** Plot the mean RMSPE against *k*. What is the optimal *k*? What is the corresponding RMSPE? Comment on the shape of the curve.
+
+**Your Answer:**
+The plot of mean RMSPE versus k shows a clear U-shaped pattern.
+For small values of k (e.g., 1–5), the error is relatively high because the model is too sensitive to individual observations (high variance). As k increases, the error decreases and reaches its minimum around k ≈ 15, where the mean RMSPE is approximately 0.175.
+After this point, the error begins to increase again for larger values of k, indicating that the model becomes too smooth (high bias).
+This behavior reflects the expected bias–variance tradeoff in kNN: small k overfits, large k oversmooths, and a moderate k provides the best balance.
+
+#### **Question 4 (5 points):** Report the mean test RMSPE and standard deviation. Create a histogram showing the distribution of the 20 test RMSPEs. Comment on the variability.
+
+**Your Answer:**
+Across the 20 train–test splits, the mean test RMSPE is 0.1988 and the standard deviation is 0.0551.
+The histogram shows that most test RMSPE values are concentrated in the 0.14 to 0.20 range, meaning the model performs fairly consistently in most splits. However, there are a few splits with noticeably higher errors around 0.26 to 0.30, and there are almost no values in the middle range between about 0.20 and 0.26.
+This suggests the variability is mainly driven by a small number of worse splits, likely because those test sets included houses that were harder to predict (e.g., more extreme prices or less typical combinations of features). Overall, performance is generally stable, but not uniform across all splits.
+
+#### **Question 5 (5 points):** Create a scatter plot of actual vs. predicted sale prices for one representative test split. Does the model perform equally well across the full price range? Where does it struggle?
+
+**Your Answer:**
+The scatter plot of actual versus predicted sale prices shows a strong positive relationship. Most points lie close to the 45-degree reference line, especially in the middle price range.
+However, the model does not perform equally well across the entire price range:
+Predictions for mid-priced homes are relatively accurate.
+The model struggles more with very expensive houses.
+High-priced homes tend to be slightly underpredicted.
+This happens because kNN averages nearby observations. Extreme properties have fewer similar neighbors, so predictions are pulled toward the overall average. As a result, the model performs best in the center of the distribution and less accurately at the extremes.
+
+---
+
+## 1.3 Comparison with `caret::train()` (10 points)
+
+Now use the automated `train()` function from `caret` with 5-fold cross-validation to find the optimal *k* over the same grid.
+
+```{r caret-comparison-regression, cache=TRUE}
+# YOUR CODE HERE
+# 1. Use caret::train() with 5-fold cross-validation to tune k
+
+# Define custom RMSPE summary function for caret::train()
+rmspeSummary <- function(data, lev = NULL, model = NULL) {
+  rmspe <- sqrt(mean(((data$pred - data$obs) / data$obs)^2))
+  c(RMSPE = rmspe)
+}
+set.seed(123)
+
+# Define 5-fold cross-validation
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  summaryFunction = rmspeSummary
+)
+
+# Train kNN model with CV over k = 1:30
+caret_model <- train(
+  SalePrice ~ .,
+  data      = ames,
+  method    = "knn",
+  tuneGrid  = data.frame(k = 1:30),
+  trControl = train_control,
+  metric    = "RMSPE"
+)
+
+# 2. Extract optimal k and corresponding RMSPE
+best_k     <- caret_model$bestTune$k
+best_rmspe <- min(caret_model$results$RMSPE)
+
+cat("Optimal k (caret train):", best_k)
+cat("\nBest CV RMSPE:", round(best_rmspe, 4))
+
+# 3. Compare with manual bootstrap results
+cat("\n\nManual bootstrap:")
+cat("\nOptimal k distribution:\n"); print(table(optimal_k))
+cat("\nMean test RMSPE:", round(mean(test_RMSPE), 4))
+
+# 4. Plot CV RMSPE vs k
+plot(caret_model$results$k,
+     caret_model$results$RMSPE,
+     type = "b",
+     xlab = "k",
+     ylab = "5-fold CV RMSPE",
+     main = "caret 5-fold CV: RMSPE vs k")
+```
+
+#### **Question 6 (5 points):** How does the optimal *k* from `train()` compare with your manual bootstrap result? Explain why they might differ (consider: validation strategy, stratification, seed handling).
+
+**Your Answer:**
+Using caret::train() with 5-fold cross-validation, the optimal k was 27, with a CV RMSPE of 0.2107.
+In contrast, my manual bootstrap approach most frequently selected smaller k values (many between 8 and 15), and the overall mean test RMSPE across 20 splits was 0.1988.
+
+The optimal k differs because the validation strategies are different:
+My manual approach used repeated bootstrap resampling within multiple train–test splits, which adds more randomness and variability.
+caret::train() uses 5-fold cross-validation on the full dataset, which is more structured and averages performance across folds.
+Differences in data partitioning, fold structure, and randomness (seed handling) can all lead to different selected k values.
+
+So both methods are valid, but they use different resampling strategies, which explains why the selected k is not the same.
+
+#### **Question 7 (5 points):** Explain the bias-variance tradeoff for kNN: what happens when *k* = 1 vs. a very large *k*?
+
+**Your Answer:**
+When k = 1, the model uses only the single nearest neighbor.
+It fits the training data very closely.
+This leads to low bias but high variance.
+The model is very sensitive to noise and may overfit.
+
+When k is very large, predictions are averaged over many neighbors.
+The model becomes smoother and more stable.
+This leads to higher bias but lower variance.
+The model may underfit because it ignores local structure.
+
+So in kNN, small k → overfitting (high variance),
+large k → underfitting (high bias).
+The optimal k balances this bias–variance tradeoff.
+
+---
+
+# Section 2: Predicting Customer Churn — kNN Classification (40 points) {#sec-classification}
+
+**Objective:** Your goal is to predict whether a telecom customer will **churn** (`Churn`: Yes/No) using kNN classification.
+
+## 2.1 Data Preprocessing (10 points)
+
+Load the Telco Customer Churn dataset and prepare it for kNN classification.
+
+**Use only the following variables:**
+
+| Variable | Description |
+|---|---|
+| `Churn` | Whether the customer churned: Yes/No (**target**) |
+| `tenure` | Number of months the customer has stayed |
+| `MonthlyCharges` | Monthly charge amount |
+| `TotalCharges` | Total charges to date |
+| `Contract` | Contract type (Month-to-month, One year, Two year) |
+| `InternetService` | Type of internet service (DSL, Fiber optic, No) |
+| `PaymentMethod` | Payment method |
+
+**Your tasks:**
+
+1. Load the data and remove `customerID`
+2. Convert `TotalCharges` to numeric and handle resulting NAs
+3. Subset to the variables listed above
+4. Convert `Churn` to a factor
+5. **Standardize all numeric predictors** (`tenure`, `MonthlyCharges`, `TotalCharges`)
+
+```{r preprocess-telco}
+# YOUR CODE HERE
+# 1. Load the data
+# churn_data <- read.csv("WA_Fn-UseC_-Telco-Customer-Churn.csv")
+# 2. Remove customerID
+# 3. Convert TotalCharges to numeric, handle NAs
+# 4. Subset to specified variables
+# 5. Convert Churn to factor
+# 6. Standardize numeric predictors
+
+# 1. Load the data
+churn_data <- read.csv("WA_Fn-UseC_-Telco-Customer-Churn.csv")
+
+# 2. Remove customerID
+churn_data <- churn_data %>% select(-customerID)
+
+# 3. Convert TotalCharges to numeric (blanks become NA), handle NAs
+churn_data$TotalCharges <- as.numeric(churn_data$TotalCharges)
+churn_data <- churn_data %>% drop_na()
+
+# 4. Subset to specified variables
+churn_data <- churn_data %>%
+  select(Churn, tenure, MonthlyCharges, TotalCharges,
+         Contract, InternetService, PaymentMethod)
+
+# 5. Convert Churn to factor
+churn_data$Churn <- factor(churn_data$Churn, levels = c("No", "Yes"))
+
+# 6. Standardize numeric predictors
+num_predictors <- c("tenure", "MonthlyCharges", "TotalCharges")
+pre_proc2 <- preProcess(churn_data[, num_predictors], method = c("center", "scale"))
+churn_data[, num_predictors] <- predict(pre_proc2, churn_data[, num_predictors])
+
+# Ensure categoricals are factors
+churn_data$Contract        <- factor(churn_data$Contract)
+churn_data$InternetService <- factor(churn_data$InternetService)
+churn_data$PaymentMethod   <- factor(churn_data$PaymentMethod)
+
+# Sanity check
+dim(churn_data)
+sum(is.na(churn_data))
+table(churn_data$Churn)
+prop.table(table(churn_data$Churn))
+
+```
+
+#### **Question 1 (5 points):** How many observations are in the final dataset? What is the class distribution of `Churn`? Is the dataset balanced or imbalanced?
+
+**Your Answer:**
+The final dataset contains 7,032 observations and 7 variables after preprocessing.
+
+The class distribution of Churn is:
+No: 5,163 customers (73.4%)
+Yes: 1,869 customers (26.6%)
+
+The dataset is imbalanced, since the majority class (“No”) represents about 73% of the data, while the minority class (“Yes”) represents only about 27%.
+
+#### **Question 2 (5 points):** Why is standardization important for kNN even when you have a mix of numeric and categorical variables?
+
+**Your Answer:**
+kNN is a distance-based algorithm, meaning predictions depend on how distances between observations are calculated. If numeric variables are on different scales (for example, TotalCharges being much larger than tenure), the larger-scale variable will dominate the distance calculation.
+Standardizing numeric predictors ensures that all numeric features contribute equally to the distance. Even when categorical variables are dummy-encoded, standardization of numeric variables is still important to prevent scale differences from biasing the model.
+
+---
+
+## 2.2 kNN Classification: Tuning and Evaluation (22 points)
+
+As with regression, tuning and evaluation happen together in **each** iteration. For every stratified train-test split, you find the optimal *k* on that split's training set, then evaluate with that *k* on that split's test set.
+
+**Requirements:**
+
+- Use `knn3()` from the `caret` package (**not** `train()`)
+- Use `predict(..., type = "class")` to get predicted class labels (this uses the default 0.5 threshold)
+- Run **20 iterations** (each with a different random stratified train-test split)
+- Within each iteration, perform a grid search over *k* (from 1 to 30, odd values) using bootstrap validation on the training set (e.g., 20 bootstrap samples per *k*)
+- Use the optimal *k* from that iteration to predict on that iteration's test set
+- Compute: **Accuracy, Precision, Recall, and F1-score**
+
+**Loop structure:**
+
+```
+for i in 1:20:
+    stratified split data into train (80%) and test (20%)
+
+    for each k in grid:
+        for j in 1:20:
+            bootstrap sample from train → boot_train
+            OOB observations → boot_val
+            fit knn3 on boot_train, predict on boot_val
+            compute accuracy
+        mean accuracy for this k (across 20 bootstraps)
+
+    optimal_k[i] ← k with highest mean accuracy for this split
+    fit knn3 with optimal_k[i] on train, predict on test
+    store: accuracy[i], precision[i], recall[i], f1[i]
+
+Report: distribution of optimal_k values and distribution of all metrics
+        (mean and SD)
+```
+
+```{r knn-classification-tuning, cache=TRUE}
+
+# YOUR CODE HERE
+# 1. Run 20 iterations, each with a fresh stratified 80/20 split
+# 2. Within each iteration: grid search with bootstrap on training set → find optimal k
+# 3. Evaluate with that optimal k on that iteration's test set
+# 4. Store optimal_k and all metrics for each iteration
+# 5. Report mean and SD for all metrics
+
+set.seed(123)
+
+k_grid <- seq(1, 30, by = 2)  # odd values only
+n_iter <- 20
+n_boot <- 20
+
+optimal_k_cls <- numeric(n_iter)
+acc_vec       <- numeric(n_iter)
+prec_vec      <- numeric(n_iter)
+rec_vec       <- numeric(n_iter)
+f1_vec        <- numeric(n_iter)
+last_mean_acc <- numeric(length(k_grid))
+
+# Save representative split for Q5
+rep_cm <- NULL
+
+# 1. Run 20 iterations, each with a fresh stratified 80/20 split
+for (i in 1:n_iter) {
+  
+  # Different seed each iteration for different stratified splits
+  set.seed(123 + i)
+  train_idx <- createDataPartition(churn_data$Churn, p = 0.8, list = FALSE)
+  train_raw <- churn_data[train_idx, ]
+  test_raw  <- churn_data[-train_idx, ]
+  
+# FIX: dummyVars on predictors only (exclude Churn)
+dummies   <- dummyVars(~ ., data = train_raw %>% select(-Churn))
+train_mat <- predict(dummies, train_raw %>% select(-Churn))  # changed
+test_mat  <- predict(dummies, test_raw  %>% select(-Churn))  # changed
+  
+  # Standardize after dummy encoding: fit on train only, apply to both
+  pre_proc_inner <- preProcess(train_mat, method = c("center", "scale"))
+  train_mat      <- predict(pre_proc_inner, train_mat)
+  test_mat       <- predict(pre_proc_inner, test_mat)
+  
+  # Re-factor Churn explicitly
+  train <- data.frame(train_mat, Churn = factor(train_raw$Churn, levels = c("No", "Yes")))
+  test  <- data.frame(test_mat,  Churn = factor(test_raw$Churn,  levels = c("No", "Yes")))
+  
+  mean_acc <- numeric(length(k_grid))
+  
+  # 2. Within each iteration: grid search with bootstrap on training set → find optimal k
+  for (ki in seq_along(k_grid)) {
+    k <- k_grid[ki]
+    boot_acc <- rep(NA, n_boot)
+    
+    for (j in 1:n_boot) {
+      boot_idx   <- sample(1:nrow(train), size = nrow(train), replace = TRUE)
+      boot_train <- train[boot_idx, ]
+      boot_val   <- train[-unique(boot_idx), ]
+      
+      if (nrow(boot_val) == 0) next
+      
+      model <- knn3(Churn ~ ., data = boot_train, k = k)
+      preds <- predict(model, boot_val, type = "class")
+      boot_acc[j] <- mean(preds == boot_val$Churn)
+    }
+    
+    mean_acc[ki] <- mean(boot_acc, na.rm = TRUE)
+  }
+  
+  # 3. Evaluate with that optimal k on that iteration's test set
+  optimal_k_cls[i] <- k_grid[which.max(replace(mean_acc, is.na(mean_acc), -Inf))]
+  
+  if (i == n_iter) last_mean_acc <- mean_acc
+  
+  final_model <- knn3(Churn ~ ., data = train, k = optimal_k_cls[i])
+  test_preds  <- predict(final_model, test, type = "class")
+  
+  # 4. Store optimal_k and all metrics for each iteration
+  cm          <- confusionMatrix(test_preds, test$Churn, positive = "Yes")
+  acc_vec[i]  <- cm$overall["Accuracy"]
+  prec_vec[i] <- cm$byClass["Precision"]
+  rec_vec[i]  <- cm$byClass["Recall"]
+  f1_vec[i]   <- cm$byClass["F1"]
+  
+  # Save last iteration for Q5
+  if (i == n_iter) rep_cm <- cm
+}
+
+# 5. Report mean and SD for all metrics
+metrics_df <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1"),
+  Mean   = round(c(mean(acc_vec), mean(prec_vec), mean(rec_vec), mean(f1_vec)), 4),
+  SD     = round(c(sd(acc_vec),   sd(prec_vec),   sd(rec_vec),   sd(f1_vec)),   4)
+)
+print(metrics_df)
+cat("\nOptimal k distribution:\n"); print(table(optimal_k_cls))
+
+# Q3: Mean accuracy vs k
+plot(k_grid, last_mean_acc, type = "b",
+     xlab = "k",
+     ylab = "Mean Accuracy",
+     main = "Mean Accuracy vs k (Last Iteration)")
+
+# Q4: Histograms for all metrics
+par(mfrow = c(2, 2))
+hist(acc_vec,  main = "Accuracy",  xlab = "Accuracy",  col = "lightblue", border = "white")
+hist(prec_vec, main = "Precision", xlab = "Precision", col = "lightblue", border = "white")
+hist(rec_vec,  main = "Recall",    xlab = "Recall",    col = "lightblue", border = "white")
+hist(f1_vec,   main = "F1-Score",  xlab = "F1",        col = "lightblue", border = "white")
+par(mfrow = c(1, 1))
+
+# Q5: Confusion matrix from representative split
+print(rep_cm)
+```
+
+#### **Question 3 (5 points):** Plot the mean accuracy against *k*. What is the optimal *k*? What is the corresponding accuracy?
+
+**Your Answer:**
+From the plot of mean accuracy vs. k, accuracy increases steadily as k grows and then levels off.
+The highest mean accuracy occurs around k = 25.
+The corresponding mean accuracy is approximately 0.79 (about 79%).
+After k ≈ 25, accuracy slightly decreases, so k = 25 gives the best performance in this grid.
+
+#### **Question 4 (5 points):** Create a summary table showing the mean and SD for all four metrics (Accuracy, Precision, Recall, F1). Which metric has the most variability? Why?
+
+**Your Answer:**
+Summary of performance across 20 splits:
+Accuracy: Mean = 0.7938, SD = 0.0096
+Precision: Mean = 0.6427, SD = 0.0271
+Recall: Mean = 0.5060, SD = 0.0268
+F1: Mean = 0.5657, SD = 0.0203
+
+The metric with the most variability is Precision (SD = 0.0271), closely followed by Recall.
+Accuracy has the smallest SD, meaning it is the most stable across splits.
+This happens because the dataset is imbalanced (about 73% “No”). Accuracy is dominated by the majority class, so it changes less. Precision and Recall depend heavily on how well the model predicts the minority class (“Yes”), which varies more across splits.
+
+#### **Question 5 (5 points):** Display and interpret the confusion matrix from one representative test split. What types of errors does the model make more often? Which type of error is more costly in the business context of customer churn?
+
+**Your Answer:**
+Confusion Matrix (representative split):
+True Negatives (No correctly predicted): 928
+False Positives (No predicted as Yes): 104
+False Negatives (Yes predicted as No): 186
+True Positives (Yes correctly predicted): 187
+
+The model makes more false negatives (186) than false positives (104).
+This means the model often fails to detect customers who will churn (low recall ≈ 0.50).
+
+In a customer churn context, false negatives are more costly, because:
+A false negative means a customer is predicted to stay but actually leaves.
+The company loses that customer without taking preventive action.
+
+False positives (predict churn when they wouldn’t) may lead to offering unnecessary retention incentives, but this is usually less costly than losing a real customer.
+So the model is good at identifying non-churners (high specificity ≈ 0.90), but struggles more with detecting actual churners.
+
+```{r confusion-matrix}
+# YOUR CODE HERE: Display confusion matrix from one representative split
+
+print(rep_cm)
+```
+
+---
+
+## 2.3 Interpretation (8 points)
+
+#### **Question 6 (4 points):** Why might accuracy alone be a misleading metric for this dataset? Which metric (precision, recall, or F1) would you prioritize if you were advising the telecom company, and why?
+
+**Your Answer:**
+Accuracy looks good here (about 79%), but it doesn’t tell the full story.
+Most customers in the dataset do not churn (around 73%). So even if the model mostly predicts “No”, it will still get a high accuracy. That means accuracy can give a false sense of confidence.
+When we look deeper, recall is only about 50%. That means the model is missing half of the customers who actually churn. In a real telecom company, those are exactly the customers we care about — the ones who are about to leave.
+If I were advising the company, I would prioritize Recall, because missing a churner (false negative) means losing revenue and possibly long-term customer value. It’s usually better to wrongly flag a customer as “at risk” than to completely miss someone who is actually going to leave.
+F1-score is also useful because it balances precision and recall, but if I had to choose one, I would focus on recall.
+
+#### **Question 7 (4 points):** What are two concrete steps you would take to improve the churn prediction model? Consider feature engineering, distance metrics, class imbalance handling, or alternative algorithms.
+
+**Your Answer:**
+1- Address the class imbalance:
+
+Right now, the model struggles to detect churners. I would try techniques like:
+Oversampling churners (e.g., SMOTE),
+Giving higher weight to the “Yes” class,
+Or adjusting the decision threshold.
+This would encourage the model to pay more attention to customers who might churn.
+
+2-Try a stronger model:
+
+kNN is simple and easy to understand, but it may not be the best choice for this type of business data. I would test models like:
+Logistic Regression (easy to interpret),
+Random Forest,
+Gradient Boosting.
+These models often capture patterns better and can improve recall without sacrificing too much precision.
+In short, I would focus on reducing missed churners and using a model that handles structured data more effectively.
+
+---
+
+## Bonus: Threshold Tuning (10 bonus points)
+
+In Section 2.2, you used `predict(..., type = "class")`, which assigns "Yes" when P(Churn) > 0.5 and "No" otherwise. But the 0.5 threshold is not necessarily optimal — especially with imbalanced data where the model tends to favor the majority class.
+
+`knn3()` can also return **predicted probabilities** using `type = "prob"`. You can then apply your own threshold to convert probabilities into class labels:
+
+```r
+probs <- predict(model, test_data, type = "prob")
+# Custom threshold: predict "Yes" if P(Yes) > threshold
+pred_custom <- ifelse(probs[, "Yes"] > threshold, "Yes", "No")
+pred_custom <- factor(pred_custom, levels = c("No", "Yes"))
+```
+
+#### **Bonus Question (10 points):** Using your optimal *k* and one representative train-test split, predict probabilities with `type = "prob"`. Try at least 5 different thresholds (e.g., 0.2, 0.3, 0.4, 0.5, 0.6). For each threshold, compute accuracy, precision, recall, and F1-score. Create a table or plot showing how these metrics change with the threshold. Which threshold would you recommend for the churn problem, and why?
+
+```{r bonus-threshold, cache=TRUE}
+# YOUR CODE HERE (optional)
+# 1. Use knn3 with type = "prob" to get predicted probabilities
+# 2. Try multiple thresholds
+# 3. Compute metrics for each threshold
+# 4. Create a table or plot
+# YOUR CODE HERE (optional)
+# 1. Use knn3 with type = "prob" to get predicted probabilities
+# 2. Try multiple thresholds
+# 3. Compute metrics for each threshold
+# 4. Create a table or plot
+
+# Use optimal k from last iteration and representative split
+set.seed(123 + 20)
+train_idx_rep <- createDataPartition(churn_data$Churn, p = 0.8, list = FALSE)
+train_raw_rep <- churn_data[train_idx_rep, ]
+test_raw_rep  <- churn_data[-train_idx_rep, ]
+
+# dummyVars on predictors only
+dummies_rep   <- dummyVars(~ ., data = train_raw_rep %>% select(-Churn))
+
+# FIX: predict on predictors only (exclude Churn)
+train_mat_rep <- predict(dummies_rep, train_raw_rep %>% select(-Churn))
+test_mat_rep  <- predict(dummies_rep, test_raw_rep  %>% select(-Churn))
+
+# Standardize: fit on train only, apply to both
+pre_proc_rep  <- preProcess(train_mat_rep, method = c("center", "scale"))
+train_mat_rep <- predict(pre_proc_rep, train_mat_rep)
+test_mat_rep  <- predict(pre_proc_rep, test_mat_rep)
+
+train_rep <- data.frame(train_mat_rep, Churn = factor(train_raw_rep$Churn, levels = c("No", "Yes")))
+test_rep  <- data.frame(test_mat_rep,  Churn = factor(test_raw_rep$Churn,  levels = c("No", "Yes")))
+
+# Fit with optimal k from last iteration
+best_k_cls  <- optimal_k_cls[20]
+bonus_model <- knn3(Churn ~ ., data = train_rep, k = best_k_cls)
+
+# 1. Get predicted probabilities
+probs <- predict(bonus_model, test_rep, type = "prob")
+
+# 2. Try multiple thresholds
+thresholds <- c(0.2, 0.3, 0.4, 0.5, 0.6)
+threshold_results <- data.frame(
+  Threshold = thresholds,
+  Accuracy  = NA, Precision = NA, Recall = NA, F1 = NA
+)
+
+# 3. Compute metrics for each threshold
+for (t in seq_along(thresholds)) {
+  pred_custom <- ifelse(probs[, "Yes"] >= thresholds[t], "Yes", "No")
+  pred_custom <- factor(pred_custom, levels = c("No", "Yes"))
+  cm_t <- confusionMatrix(pred_custom, test_rep$Churn, positive = "Yes")
+  threshold_results$Accuracy[t]  <- round(cm_t$overall["Accuracy"], 4)
+  threshold_results$Precision[t] <- round(cm_t$byClass["Precision"], 4)
+  threshold_results$Recall[t]    <- round(cm_t$byClass["Recall"], 4)
+  threshold_results$F1[t]        <- round(cm_t$byClass["F1"], 4)
+}
+
+kable(threshold_results, digits = 4, caption = "Metrics by Threshold")
+
+# 4. Plot metrics vs threshold
+plot(thresholds, threshold_results$Accuracy, type = "b",
+     ylim = c(0, 1), xlab = "Threshold", ylab = "Metric Value",
+     main = "Metrics vs Threshold")
+lines(thresholds, threshold_results$Precision, type = "b", lty = 2)
+lines(thresholds, threshold_results$Recall,    type = "b", lty = 3)
+lines(thresholds, threshold_results$F1,        type = "b", lty = 4)
+legend("topright", legend = c("Accuracy", "Precision", "Recall", "F1"),
+       lty = 1:4)
+```
+
+**Your Answer:**
+I tested five thresholds (0.2 to 0.6) using predicted probabilities.
+As the threshold increases:
+Accuracy and precision increase
+Recall decreases
+At a low threshold (0.2), recall is very high (0.85), meaning we catch most churners, but precision is low.
+At a high threshold (0.6), precision is high, but recall drops a lot (only 0.41), meaning we miss many churners.
+The best balance is at threshold = 0.3, which gives:
+The highest F1-score (0.6125)
+Good recall (0.75)
+Reasonable precision (0.52)
+
+For a telecom company, missing churners is costly. So I would recommend threshold = 0.3, because it catches more customers who are likely to leave while keeping overall performance stable.
+This shows that the default 0.5 threshold is not necessarily optimal for imbalanced churn data.
+
+---
+
+# Wrap-Up: Comparing the Two Tasks (10 points)
+
+#### **Question 1 (5 points):** Compare your regression and classification results side by side. Create a figure with two panels: (a) RMSPE vs. *k* for regression, and (b) accuracy vs. *k* for classification. How do the optimal *k* values compare? Why might they differ?
+
+```{r comparison-plot}
+# YOUR CODE HERE: Create side-by-side comparison plot
+
+# Separate k grids for regression and classification
+k_grid_reg <- 1:30
+k_grid_cls <- seq(1, 30, by = 2)
+
+par(mfrow = c(1, 2))
+
+# Panel A: RMSPE vs k (regression)
+plot(k_grid_reg, last_mean_rmspe, type = "b",
+     xlab = "k", ylab = "Mean RMSPE",
+     main = "(a) Regression: RMSPE vs k")
+
+# Panel B: Accuracy vs k (classification)
+plot(k_grid_cls, last_mean_acc, type = "b",
+     xlab = "k", ylab = "Mean Accuracy",
+     main = "(b) Classification: Accuracy vs k")
+
+par(mfrow = c(1, 1))
+
+```
+
+**Your Answer:**
+When comparing the two panels:
+In the regression task, the lowest RMSPE occurs around k ≈ 15.
+In the classification task, the highest accuracy occurs around k ≈ 25.
+So the optimal k values are different.
+
+This makes sense because regression and classification measure performance differently.
+Regression is minimizing prediction error (RMSPE), while classification is maximizing accuracy. The way averaging affects numeric values (regression) is not the same as how it affects class boundaries (classification). Therefore, the k that best smooths numeric predictions is not necessarily the same k that best separates classes.
+
+#### **Question 2 (5 points):** Reflecting on both tasks, explain the bias-variance tradeoff as it applies to the choice of *k* in kNN. How did you observe this tradeoff in your results? What are the main limitations of kNN that you encountered?
+
+**Your Answer:**
+The bias–variance tradeoff is very clear in both plots.
+
+When k is small, the model is very flexible. It closely follows the training data, which means low bias but high variance. This can cause unstable predictions.
+
+When k is large, the model becomes smoother. It averages many neighbors, which reduces variance but increases bias.
+In the regression plot, small k values show more fluctuation in RMSPE. Around k ≈ 15, the model balances smoothness and accuracy.
+
+In classification, accuracy steadily improves as k increases, meaning more smoothing helps reduce noisy class decisions.
+
+Main limitations of kNN that I observed:
+It is very sensitive to the choice of k.
+It requires proper scaling of features.
+It can struggle with imbalanced data (as seen in the churn task).
+It does not perform automatic feature selection.
+It can become computationally expensive for large datasets.
+Overall, kNN is simple and intuitive, but its performance depends heavily on preprocessing and tuning.
+
+---
+
+# Submission Checklist
+
+Before submitting, ensure:
+
+- [*] All code chunks run without errors
+- [*] All questions answered with explanations (not just code output)
+- [*] Plots are properly labeled with titles and axis labels
+- [*] Numeric predictors standardized before kNN
+- [*] Bootstrap validation implemented manually (NOT using `train()` for tuning)
+- [*] 20 test iterations completed with mean and SD reported
+- [*] Team members listed in author field
+- [*] LLM usage disclosed (if applicable)
+- [*] Both `.qmd` and `.html` files submitted
+
+---
+
+**Good luck with your analysis!**
